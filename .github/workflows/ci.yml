@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      # Release mode matters: the decoder's unfilter/expand_paletted kernels are
+      # gated byte-identical against their scalar twins, and those SIMD paths are
+      # what the oracle tests compare.
+      - name: Test (release, default = zlib-rs)
+        run: cargo test --release
+      # The other DEFLATE backend must stay green too: `zlib-rs` is on by
+      # default, but `--no-default-features` routes through miniz_oxide, and PNG
+      # output has to be valid either way.
+      - name: Test (release, miniz_oxide backend)
+        run: cargo test --release --no-default-features
+      # The bench-only kernel exports and the stage profiler must still compile.
+      - name: Build (benchmarks + profile)
+        run: cargo build --release --features benchmarks,profile
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      # Advisory, not gating. This crate is a fork of image-rs/image-png carried
+      # close to upstream (see UPSTREAM-CHANGES.md) — the ~16 inherited clippy
+      # nits are left alone so the diff against upstream stays reviewable, and
+      # blanket-fixing them would be churn no measurement asked for.
+      - run: cargo clippy --release --all-targets --features benchmarks,profile
+        continue-on-error: true
