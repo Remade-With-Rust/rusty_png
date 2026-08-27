@@ -26,55 +26,66 @@ Measured against system **FFmpeg 8.1.2** on the same machine, **one pinned core
 each**, on-core CPU **cycles** (not wall — wall on this box threw 8,285 ms
 outliers on a 156 ms job), arms **ABBA-interleaved**, best-of-N with a paired
 win-rate and z-score. **Null-arm floor 2.0–2.3%**; nothing inside that band is
-reported as a result. Content is **real**: frame 0 of the lossless Derf/xiph
+reported as a result, and a row whose useful work sits under 3× its own process
+launch is refused rather than estimated. Content is **real**, from two corpora:
+the public **CLIC professional** validation set (native-RGB photography, so it
+is citable and reproducible by anyone) and frame 0 of the lossless **Derf/xiph**
 originals, plus real screenshots, matplotlib charts, diagrams and logos — the
 two synthetic images in early runs were dropped once real graphics showed
 different behaviour.
 
 | | vs FFmpeg | verdict |
 |---|---|---|
-| **Decode** | **2.67–2.95× faster** | 6 real images, 15/15 paired wins each, z = 3.87 |
-| **Encode** | **parity to 1.17× faster, at 0.2–6.0% smaller** | at a matched operating point, with `zlib-rs` |
+| **Decode, per core** | **2.55–2.89× faster** (median 2.60×) | decode-only, PNG → rgb24, 5 admissible images, z = 3 |
+| **Encode, wall clock, multi-core** | **2.11–3.06× faster, 0.1–0.2% smaller** | end-to-end, matched filter + level, `parallel` |
+| **Encode, per core, same filter + size** | **0.94–1.05×** on CLIC photographs (median 0.97×) · **0.86–0.91×** on Derf video frames | encode-only from raw; which DEFLATE is faster doing identical work |
+| **Graphics size, default settings** | **−6.1%** *(was +115.6%)* | 9 real screenshots/charts/diagrams/logos |
 
-Both numbers are deliberately unflattering to us where the methodology allows a
-choice:
+Every row is one direction only. The **encode** row feeds both arms **raw
+pixels**, so neither decodes — measuring encode by transcoding a PNG lets a
+decode win (which we have, and it is large) inflate a number labelled encode,
+and that is exactly how an earlier draft of this table briefly read 1.20× in our
+favour. Likewise the wall-clock row is a **multi-core vs single-core**
+comparison and is labelled as such: FFmpeg's PNG encoder is single-threaded for
+one image, which is the structural point, but it is never quoted as a per-core
+win, and the per-core row is kept directly beneath it.
 
-- **Encode is compared at a matched operating point, and the operating point is
-  chosen against us.** PNG is lossless, so "faster" is meaningless without
-  fixing size. Our shipped default (`Fast`/`Sub`) is 6.0× faster than FFmpeg's
-  default but **+16.5% larger** — a different point on the curve, and quoting it
-  would price our missing bits as speed. At `Compression::Default` + `Up` with
-  `zlib-rs` we are **1.00×/1.06×/1.14×/1.17×** against FFmpeg's default while
-  producing **−6.0%/−0.2%/−3.3%/−4.5%** bytes. Against `Compression::Best` the
-  fair reference is FFmpeg `-compression_level 9`, not its default; comparing
-  our maximum to their default is the same error in the other direction.
-- **Decode is compared with identical work on both sides** — one process per
-  arm, same input, same job, output discarded on both. An earlier probe read the
-  *opposite* way (FFmpeg ahead) purely because it charged FFmpeg for process
-  launch, demux and file read while timing our side in-process with none of
-  those. A second bug had our arm decoding *twice* per iteration. Both are
-  recorded in `WHYS.md`; neither number is quoted here.
+Per core, encode is at **parity on photographs and ~13% behind on video
+frames**. That split is real and reproduces under one instrument, so it is
+reported as two ranges rather than averaged into one.
 
-### Where the time actually goes
+## Memory
 
-From the crate's own per-row stage profiler (`--features profile`), on real
-content. This is what set the optimisation order — and what ruled work *out*:
+The encoder used to hold several full copies of the image at once. Removing them
+is where this fork found its largest reproducible wins — and they are **memory**
+wins: every speed measurement taken alongside them landed inside the noise floor,
+so none is claimed.
 
-| stage | photographic | graphics |
-|---|---|---|
-| **encode** `deflate` | **97.8–99.5%** | 94.3–99.0% |
-| encode `filter` | 0.2% | 0.5–3.0% |
-| **decode** `inflate` | **50.3–63.9%** | 7.5–27.6% |
-| **decode** `unfilter` | 30.0–40.5% | **53.7–66.3%** |
-| decode `transform` | 3.8–7.4% | 6.5–28.1% |
+Measured as peak working set, **same configuration at both ends** (a 8.3 MPx
+frame unless noted):
 
-At quality settings encode is **almost entirely DEFLATE** — so the PNG layer
-(filtering) is not worth optimising there, and the backend is. FFmpeg's encode
-is deflate-dominated too, by ablation against its own flags. (That ablation's
-*filter* term came out **negative** — it was differencing two ~1,200 Mcyc
-measurements to extract a ~10 Mcyc one, so only the deflate term is admissible.)
+| configuration | before | after | |
+|---|---|---|---|
+| `-compression_level 6`, 1 thread | 94.9 MB | **57.6 MB** | **−39%** |
+| `-compression_level 6`, `-threads 8` | 118.7 MB | **85.1 MB** | **−28%** |
+| default (`Fast`) | 101.1 MB | **77.3 MB** | **−24%** |
 
-Decode inverts on graphics: **unfiltering**, not inflate, is the majority there.
+Three redundancies went:
+
+1. **A whole-frame clone** taken whenever the source rows were already tight —
+   the common case — duplicating a buffer the encoder already held.
+2. **The accumulated IDAT.** The whole compressed stream was built in one buffer
+   and then copied into the writer, because a chunk carries its length ahead of
+   its payload. Fixed 256 KiB chunks remove the need to know the total at all.
+3. **Two of the parallel path's three copies.** It wrote each worker's block to
+   its own `Vec`, concatenated them all into a second buffer, then copied that
+   again to prepend two header bytes. Blocks now go out as each worker is
+   joined, and the IDAT payload is **byte-identical at 2, 4 and 8 threads**.
+
+`Fast` gains the least on purpose: it compresses, then compares the finished
+size against a stored-mode bound and re-encodes if compression lost, so it
+cannot stream. That check is not vestigial — fdeflate expands uniform random
+bytes **1.3686×** and it does fire.
 
 ## Why the fork
 
@@ -85,22 +96,38 @@ Two things upstream cannot address for a drop-in FFmpeg replacement:
    upstream routes those through `flate2` → `miniz_oxide` while FFmpeg uses
    zlib. Switching to `zlib-rs` — flate2's **pure-Rust** zlib rewrite, which maps
    to `any_zlib`, *not* `any_c_zlib`, so no C enters the tree — measured
-   **1.68–2.72× faster** at `Default` with size within ±3%, closing that gap to
-   parity-or-better.
+   **1.68–2.72× faster** at `Default` with size within ±3%. That took the gap
+   from 2.6–4.4× to **parity on photographs (0.94–1.05×) and ~1.15× on video
+   frames**, at 0.2–0.3% *smaller* output. Since the profiler puts DEFLATE at
+   94–99.5% of encode, whatever residue remains *is* the deflate gap, not a PNG
+   gap — closing the last of it means beating zlib's C, which is the open item.
 2. **One hard-coded operating point is the wrong default for PNG.**
    `Fast`/`Sub`/non-adaptive is genuinely excellent on photographs — faster *and*
    smaller than every FFmpeg `-compression_level 1` configuration — and poor on
    graphics, where it ran **+130.1%** against FFmpeg's default across nine real
-   screenshots/charts/diagrams. The same corpus at the crate's *best reachable*
-   settings comes out **−5.7%**. The winning configuration is content-dependent
+   screenshots/charts/diagrams. The winning configuration is content-dependent
    and measured so (`best/up` on charts, `best/sub` on screenshots,
    `default/sub/adaptive` on diagrams, `best/paeth` on UI art), which makes a
    single fixed default an unfinished dispatch rather than a tuning choice.
+   `rff-codec-png` now dispatches on a measured content signal — repeated-pixel
+   fraction, which separates photographs (0.0366–0.2037) from real graphics
+   (0.5312–0.9790) with **nothing in between** — taking that corpus from
+   **+115.6% to −6.1%** vs FFmpeg while leaving photographs byte-identical.
 
-Every change is gated: the fork is **byte-identical to upstream `png` 0.17.16**
-across **600 comparisons** (20 images × 30 configurations, encode bytes *and*
-decoded pixels), and the full upstream test suite — pngsuite conformance
-included — runs green.
+Every change is gated against upstream `png` 0.17.16, and since **streamed IDAT**
+landed the gate reports two properties separately rather than one verdict:
+
+- **Upstream decodes our output to the source pixels: 330/330.** This is the
+  property that must never break, and it holds everywhere.
+- **Encode bytes identical to upstream: 190/330.** The 140 that differ are
+  `Default`/`Best` on images whose compressed stream exceeds one 256 KiB chunk —
+  we emit a run of IDATs where upstream emits one. `Fast` is byte-identical on
+  every image, and so is anything small enough to fit a single chunk.
+
+The DEFLATE payload itself is unchanged — on a 14.6 MB stream the concatenated
+IDAT contents are byte-for-byte what upstream produces; only the chunk framing
+differs, at a cost of **+0.0045%** file size. The full upstream test suite —
+pngsuite conformance included — runs green.
 
 ## Decode
 
@@ -154,8 +181,9 @@ is the strongest setting on text and screenshot content.
 
 | Feature | Default | Effect |
 |---|---|---|
-| `zlib-rs` | **no** | DEFLATE via flate2's **pure-Rust** zlib rewrite instead of `miniz_oxide`. Measured **1.68–2.72×** faster at `Compression::Default`, size within ±3%. Maps to flate2's `any_zlib`, not `any_c_zlib` — no C is introduced. Off by default pending the `Best`-on-graphics dispatch question (see `WHYS.md`). |
+| `zlib-rs` | **yes** | DEFLATE via flate2's **pure-Rust** zlib rewrite instead of `miniz_oxide`. Measured **1.68–2.72×** faster at `Compression::Default`, size within ±3%. Maps to flate2's `any_zlib`, not `any_c_zlib` — no C is introduced. On by default: it dominates at `Default` (faster on 13/13, size within ±4.4%). At `Best` it is smaller on 9/9 real graphics but slower on 5/9 — recorded, not averaged away; reaching sizes miniz_oxide cannot reach at any speed is what `Best` is for. |
 | `profile` | no | Per-row stage profiler (filter/deflate on encode; inflate/unfilter/transform on decode). Scopes are per *row*, so the tap costs <0.1% of a 1080p encode; compiles to nothing when off. |
+| `parallel` | no | Multi-threaded DEFLATE for a **single** image (pigz-style block splitting). **2.11–3.06× end-to-end vs FFmpeg** at matched filter and level, while staying 0.1–0.2% smaller. Applies to `Compression::Default`/`Best` only — `Fast` is `fdeflate`, a single-stream path. Blocks are *sized* (≥1 MiB), never counted, so an image too small to split stays serial and pays **+0.00%**; forcing 24 blocks on a 1.44 MB chart would have cost **+7.44%**. |
 | `benchmarks` | no | Expose internal kernels (`unfilter`, `expand_paletted`) for A/B oracle tests. |
 | `unstable` | no | `crc32fast/nightly`. |
 

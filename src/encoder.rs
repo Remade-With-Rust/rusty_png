@@ -158,6 +158,11 @@ struct Options {
     adaptive_filter: AdaptiveFilterType,
     sep_def_img: bool,
     validate_sequence: bool,
+    /// Worker budget for multi-threaded DEFLATE. 1 = serial, which is the
+    /// default: threading changes the compressed bytes (not the pixels), so it
+    /// is opt-in.
+    #[cfg(feature = "parallel")]
+    par_threads: usize,
 }
 
 impl<'a, W: Write> Encoder<'a, W> {
@@ -333,6 +338,31 @@ impl<'a, W: Write> Encoder<'a, W> {
     /// [`AdaptiveFilterType::NonAdaptive`].
     pub fn set_adaptive_filter(&mut self, adaptive_filter: AdaptiveFilterType) {
         self.options.adaptive_filter = adaptive_filter;
+    }
+
+    /// Compress a single image across up to `threads` workers.
+    ///
+    /// DEFLATE is 77–82% of encode at [`Compression::Fast`] and 94–99.5% at
+    /// [`Compression::Default`]/[`Compression::Best`], so this is where the
+    /// time is. Measured on this machine at level 6 (zlib-rs), 8 workers:
+    ///
+    /// | image | filtered | serial | parallel | speedup | size cost |
+    /// |---|---|---|---|---|---|
+    /// | 8.3 MPx photo | 24.9 MB | 698 ms | 148 ms | **4.71×** | +0.03% |
+    /// | 8.3 MPx sky | 24.9 MB | 873 ms | 162 ms | **5.40×** | +0.04% |
+    /// | 3.9 MPx UI art | 11.7 MB | 190 ms | 29 ms | **6.53×** | +0.05% |
+    ///
+    /// **The output bytes change** (the pixels do not) — block boundaries reset
+    /// the DEFLATE dictionary, which is why this is opt-in rather than the
+    /// default. The cost is bounded by a minimum block size, so an image too
+    /// small to split stays serial and pays exactly nothing: a 1.44 MB chart
+    /// keeps one block and +0.00%, where forcing 24 blocks on it would have cost
+    /// **+7.44%**.
+    ///
+    /// `threads <= 1` disables it.
+    #[cfg(feature = "parallel")]
+    pub fn set_parallel(&mut self, threads: usize) {
+        self.options.par_threads = threads;
     }
 
     /// Set the fraction of time every frame is going to be displayed, in seconds.
@@ -546,15 +576,104 @@ impl PartialInfo {
 
 const DEFAULT_BUFFER_LENGTH: usize = 4 * 1024;
 
-pub(crate) fn write_chunk<W: Write>(mut w: W, name: chunk::ChunkType, data: &[u8]) -> Result<()> {
+pub(crate) fn write_chunk<W: Write>(w: W, name: chunk::ChunkType, data: &[u8]) -> Result<()> {
+    write_chunk_io(w, name, data).map_err(Into::into)
+}
+
+/// [`write_chunk`] with an `io::Result`, so it can be called from a `Write`
+/// impl without a detour through [`EncodingError`] and back.
+fn write_chunk_io<W: Write>(
+    mut w: W,
+    name: chunk::ChunkType,
+    data: &[u8],
+) -> std::io::Result<()> {
     w.write_be(data.len() as u32)?;
     w.write_all(&name.0)?;
     w.write_all(data)?;
-    let mut crc = Crc32::new();
-    crc.update(&name.0);
-    crc.update(data);
-    w.write_be(crc.finalize())?;
+    let checksum = {
+        crate::prof_scope!(crate::prof::ENC_CRC);
+        let mut crc = Crc32::new();
+        crc.update(&name.0);
+        crc.update(data);
+        crc.finalize()
+    };
+    w.write_be(checksum)?;
     Ok(())
+}
+
+/// Payload of one streamed IDAT chunk.
+///
+/// PNG lets an image carry any number of IDAT chunks and decoders concatenate
+/// their payloads, so this is purely a buffering choice, not a format one.
+/// 256 KiB keeps the buffer cache-resident while holding the per-chunk overhead
+/// (4 length + 4 type + 4 CRC) to 12 bytes per 256 KiB — 0.005% of the stream,
+/// or 816 bytes on a 17 MB IDAT. libpng's default is 8 KiB, which would cost
+/// 0.15%.
+const STREAM_CHUNK: usize = 256 * 1024;
+
+/// A `Write` that emits IDAT chunks as the compressed bytes arrive.
+///
+/// The encoder used to accumulate the ENTIRE compressed stream in one `Vec` and
+/// only then copy all of it into the caller's writer, because an IDAT carries
+/// its length ahead of its payload and the total was not known until the end.
+/// On an 8.3 MPx frame that is a 17 MB buffer built and then copied in full.
+///
+/// Emitting fixed-size chunks removes the need to know the total at all: each
+/// chunk's length is known the moment its buffer fills. Peak memory drops from
+/// the whole compressed stream to [`STREAM_CHUNK`].
+struct IdatStreamer<'a, W: Write> {
+    w: &'a mut W,
+    buf: Vec<u8>,
+}
+
+impl<'a, W: Write> IdatStreamer<'a, W> {
+    fn new(w: &'a mut W) -> Self {
+        Self {
+            w,
+            buf: Vec::with_capacity(STREAM_CHUNK),
+        }
+    }
+
+    /// Emit whatever is buffered as one IDAT. A zero-length IDAT is legal but
+    /// pointless, so an empty buffer emits nothing.
+    fn emit(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        crate::prof_scope!(crate::prof::ENC_CHUNK);
+        write_chunk_io(&mut *self.w, chunk::IDAT, &self.buf)?;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Flush the trailing partial chunk. Must be called before drop; `Drop`
+    /// cannot report an I/O failure, so this is explicit rather than implicit.
+    fn finish(mut self) -> std::io::Result<()> {
+        self.emit()
+    }
+}
+
+impl<W: Write> Write for IdatStreamer<'_, W> {
+    fn write(&mut self, mut data: &[u8]) -> std::io::Result<usize> {
+        let total = data.len();
+        while !data.is_empty() {
+            let space = STREAM_CHUNK - self.buf.len();
+            let take = space.min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buf.len() == STREAM_CHUNK {
+                self.emit()?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Deliberately NOT emitting a chunk: `flush` is called by wrappers at
+    /// arbitrary points, and honouring it would cut short chunks all through
+    /// the stream. The trailing partial chunk goes out in [`Self::finish`].
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w.flush()
+    }
 }
 
 impl<W: Write> Writer<W> {
@@ -694,6 +813,97 @@ impl<W: Write> Writer<W> {
         let filter_method = self.options.filter;
         let adaptive_method = self.options.adaptive_filter;
 
+        // Can the compressed bytes go STRAIGHT OUT as IDAT chunks, or must they
+        // be accumulated first?
+        //
+        // Streaming needs the destination to be ready before compression
+        // starts, so it is only available when nothing has to be written
+        // between the header and the image data. An animation frame has an
+        // fcTL in front of it and animation frames after the first are fdAT,
+        // not IDAT, so those keep the accumulate-then-write path.
+        //
+        // `Fast` also keeps it, and not by choice: that path compresses, then
+        // compares the FINISHED size against `StoredOnlyCompressor`'s bound and
+        // re-encodes in stored mode if compression lost. Streaming can never
+        // know the finished size, and the check is not vestigial — measured,
+        // fdeflate expands uniform random bytes by 1.3686x and the fallback
+        // does fire. Giving it up would make incompressible images ~37% larger,
+        // which is not a trade worth a few ms.
+        //
+        // Parallel DEFLATE streams too. It builds `[header] [blocks in order]
+        // [Adler-32]`, none of which needs the total compressed size, so its
+        // workers' output can go straight out as each one is joined. NOTE that
+        // this check sits in FRONT of the `match` below: whatever it lets
+        // through never reaches the match arms, so a config handled here must
+        // be handled *correctly* here — routing a multi-threaded encode into
+        // the serial branch would silently disable a 2.11-3.06x feature without
+        // failing a test, because the output would still be valid.
+        #[cfg(feature = "parallel")]
+        let par_active = self.options.par_threads > 1
+            && crate::pardeflate::block_count((in_len + 1) * height, self.options.par_threads) > 1;
+        #[cfg(not(feature = "parallel"))]
+        let par_active = false;
+
+        let can_stream_idat = !matches!(self.info.compression, Compression::Fast)
+            && (self.info.frame_control.is_none()
+                || self.should_skip_frame_control_on_default_image());
+
+        if can_stream_idat {
+            let mut current = vec![0; in_len];
+            let mut sink = IdatStreamer::new(&mut self.w);
+
+            #[cfg(feature = "parallel")]
+            if par_active {
+                // The block splitter needs the whole filtered image up front,
+                // so this one buffer stays. Filtering is 0.2-4% of encode, so
+                // keeping it serial costs nothing measurable.
+                let mut filtered = Vec::with_capacity((in_len + 1) * height);
+                for line in data.chunks(in_len) {
+                    let filter_type = {
+                        crate::prof_scope!(crate::prof::ENC_FILTER);
+                        filter(filter_method, adaptive_method, bpp, prev, line, &mut current)
+                    };
+                    filtered.push(filter_type as u8);
+                    filtered.extend_from_slice(&current);
+                    prev = line;
+                }
+                {
+                    crate::prof_scope!(crate::prof::ENC_DEFLATE);
+                    crate::pardeflate::compress_parallel_to(
+                        &mut sink,
+                        &filtered,
+                        in_len + 1,
+                        self.info.compression.to_level(),
+                        self.options.par_threads,
+                    )?;
+                }
+                sink.finish()?;
+                self.increment_images_written();
+                return Ok(());
+            }
+
+            {
+                let mut zlib = ZlibEncoder::new(&mut sink, self.info.compression.to_options());
+                for line in data.chunks(in_len) {
+                    let filter_type = {
+                        crate::prof_scope!(crate::prof::ENC_FILTER);
+                        filter(filter_method, adaptive_method, bpp, prev, line, &mut current)
+                    };
+                    {
+                        crate::prof_scope!(crate::prof::ENC_DEFLATE);
+                        zlib.write_all(&[filter_type as u8])?;
+                        zlib.write_all(&current)?;
+                    }
+                    prev = line;
+                }
+                crate::prof_scope!(crate::prof::ENC_DEFLATE);
+                zlib.finish()?;
+            }
+            sink.finish()?;
+            self.increment_images_written();
+            return Ok(());
+        }
+
         let zlib_encoded = match self.info.compression {
             Compression::Fast => {
                 let mut compressor = fdeflate::Compressor::new(std::io::Cursor::new(Vec::new()))?;
@@ -720,7 +930,10 @@ impl<W: Write> Writer<W> {
                     prev = line;
                 }
 
-                let compressed = compressor.finish()?.into_inner();
+                let compressed = {
+                    crate::prof_scope!(crate::prof::ENC_FINISH);
+                    compressor.finish()?.into_inner()
+                };
                 if compressed.len()
                     > fdeflate::StoredOnlyCompressor::<()>::compressed_size((in_len + 1) * height)
                 {
@@ -741,6 +954,43 @@ impl<W: Write> Writer<W> {
                 } else {
                     compressed
                 }
+            }
+            // Multi-threaded DEFLATE, when asked for and when the image is big
+            // enough to split without paying for it. Filtering happens first
+            // into one buffer (it is 0.2-3% of encode, so keeping it serial
+            // costs nothing measurable), then the block splitter takes over.
+            #[cfg(feature = "parallel")]
+            _ if self.options.par_threads > 1
+                && crate::pardeflate::block_count(
+                    (in_len + 1) * height,
+                    self.options.par_threads,
+                ) > 1 =>
+            {
+                let mut current = vec![0; in_len];
+                let mut filtered = Vec::with_capacity((in_len + 1) * height);
+                for line in data.chunks(in_len) {
+                    let filter_type = {
+                        crate::prof_scope!(crate::prof::ENC_FILTER);
+                        filter(
+                            filter_method,
+                            adaptive_method,
+                            bpp,
+                            prev,
+                            line,
+                            &mut current,
+                        )
+                    };
+                    filtered.push(filter_type as u8);
+                    filtered.extend_from_slice(&current);
+                    prev = line;
+                }
+                crate::prof_scope!(crate::prof::ENC_DEFLATE);
+                crate::pardeflate::compress_parallel(
+                    &filtered,
+                    in_len + 1,
+                    self.info.compression.to_level(),
+                    self.options.par_threads,
+                )?
             }
             _ => {
                 let mut current = vec![0; in_len];
@@ -827,6 +1077,10 @@ impl<W: Write> Writer<W> {
     }
 
     fn write_zlib_encoded_idat(&mut self, zlib_encoded: &[u8]) -> Result<()> {
+        // CRC32 over every IDAT payload plus the writes themselves. Previously
+        // unscoped, so it landed in the profiler's residue rather than in a
+        // stage — on a 14 MB IDAT that is not a rounding error.
+        crate::prof_scope!(crate::prof::ENC_CHUNK);
         for chunk in zlib_encoded.chunks(Self::MAX_IDAT_CHUNK_LEN as usize) {
             self.write_chunk(chunk::IDAT, chunk)?;
         }
@@ -1727,6 +1981,13 @@ impl<W: Write> Drop for StreamWriter<'_, W> {
 /// Since this only contains trait impls, there is no need to make this public, they are simply
 /// available when the mod is compiled as well.
 impl Compression {
+    /// Numeric DEFLATE level, for the parallel path which drives `Compress`
+    /// directly rather than through `ZlibEncoder`.
+    #[cfg(feature = "parallel")]
+    fn to_level(self) -> u32 {
+        self.to_options().level()
+    }
+
     fn to_options(self) -> flate2::Compression {
         #[allow(deprecated)]
         match self {
