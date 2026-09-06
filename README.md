@@ -1,3 +1,4 @@
+### In The Wild with 817 Active Installs
 > **In the wild** — [RAG Converter](https://ragconverter.com) uses `rusty_png` to decode the images.
 > It makes personal and work files AI-readable without them leaving the machine:
 > the whole conversion runs as WebAssembly in the browser tab, with nothing
